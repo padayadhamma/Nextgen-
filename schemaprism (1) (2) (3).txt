@@ -1,0 +1,1117 @@
+// schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== CORE USER MODELS ====================
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  passwordHash  String    // bcrypt hashed
+  role          UserRole  @default(STUDENT)
+  name          String
+  phone         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  // Relations
+  studentProfile StudentProfile?
+  adminProfile   AdminProfile?
+  
+  @@map("users")
+}
+
+enum UserRole {
+  ADMIN
+  STUDENT
+}
+
+model AdminProfile {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  designation String   @default("Teacher")
+  classes     Class[]
+  
+  @@map("admin_profiles")
+}
+
+model StudentProfile {
+  id                String          @id @default(uuid())
+  userId            String          @unique
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // QR Code for Attendance (Encrypted)
+  qrCodeHash        String          @unique // SHA-256 of unique student identifier
+  qrCodeEncrypted   String          // AES-256 encrypted payload
+  
+  // Grade level (6-11)
+  gradeLevel        Int
+  preferredLanguage Language        @default(ENGLISH)
+  
+  // Subscription Status
+  subscription      Subscription?
+  
+  // Relations
+  attendanceRecords AttendanceRecord[]
+  classEnrollments  ClassEnrollment[]
+  progress          LessonProgress[]
+  
+  @@map("student_profiles")
+}
+
+enum Language {
+  SINHALA
+  ENGLISH
+}
+
+// ==================== SUBSCRIPTION & PAYMENTS ====================
+
+model Subscription {
+  id              String            @id @default(uuid())
+  studentId       String            @unique
+  student         StudentProfile    @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  
+  status          SubscriptionStatus @default(INACTIVE)
+  planType        PlanType          @default(MONTHLY)
+  
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  
+  // Payment history
+  payments        Payment[]
+  
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  
+  @@map("subscriptions")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  PENDING
+  GRACE_PERIOD
+}
+
+enum PlanType {
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+model Payment {
+  id              String          @id @default(uuid())
+  subscriptionId  String
+  subscription    Subscription    @relation(fields: [subscriptionId], references: [id])
+  
+  // PayHere Integration
+  payherePaymentId String?        @unique
+  payhereOrderId   String?
+  
+  amount          Decimal         @db.Decimal(10, 2)
+  currency        String          @default("LKR")
+  status          PaymentStatus   @default(PENDING)
+  
+  // Webhook tracking
+  webhookPayload  Json?
+  webhookReceivedAt DateTime?
+  
+  paidAt          DateTime?
+  createdAt       DateTime        @default(now())
+  
+  @@map("payments")
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+// ==================== QR ATTENDANCE SYSTEM ====================
+
+model AttendanceRecord {
+  id              String          @id @default(uuid())
+  studentId       String
+  student         StudentProfile  @relation(fields: [studentId], references: [id])
+  
+  // Scan metadata
+  scannedAt       DateTime        @default(now())
+  scannedBy       String          // Admin user ID who scanned
+  scannerLocation String?         // Optional: classroom identifier
+  
+  // Student state at time of scan
+  subscriptionStatusAtScan SubscriptionStatus
+  paymentValidAtScan       Boolean
+  
+  // Class context
+  classId         String?
+  class           Class?          @relation(fields: [classId], references: [id])
+  
+  // Verification
+  qrCodeHashUsed  String          // Audit trail
+  isValid         Boolean         @default(true) // False if QR was reused/invalid
+  
+  @@index([studentId, scannedAt])
+  @@index([scannedAt])
+  @@map("attendance_records")
+}
+
+// ==================== CONTENT & CLASSES ====================
+
+model Class {
+  id            String          @id @default(uuid())
+  name          String
+  nameSinhala   String?
+  gradeLevel    Int
+  teacherId     String
+  teacher       AdminProfile    @relation(fields: [teacherId], references: [id])
+  
+  schedule      Json            // { day: string, time: string, duration: number }
+  
+  enrollments   ClassEnrollment[]
+  lessons       Lesson[]
+  attendanceRecords AttendanceRecord[]
+  
+  createdAt     DateTime        @default(now())
+  
+  @@map("classes")
+}
+
+model ClassEnrollment {
+  id          String          @id @default(uuid())
+  studentId   String
+  student     StudentProfile  @relation(fields: [studentId], references: [id])
+  classId     String
+  class       Class           @relation(fields: [classId], references: [id])
+  enrolledAt  DateTime        @default(now())
+  
+  @@unique([studentId, classId])
+  @@map("class_enrollments")
+}
+
+model Lesson {
+  id            String          @id @default(uuid())
+  classId       String
+  class         Class           @relation(fields: [classId], references: [id])
+  
+  title         String
+  titleSinhala  String?
+  description   String?
+  orderIndex    Int
+  
+  // Content
+  video         VideoContent?
+  pdfTute       PdfContent?
+  
+  createdAt     DateTime        @default(now())
+  
+  @@map("lessons")
+}
+
+model VideoContent {
+  id            String    @id @default(uuid())
+  lessonId      String    @unique
+  lesson        Lesson    @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  
+  // Secure streaming - no direct URLs stored
+  muxAssetId    String    // Mux video streaming service
+  playbackId    String    // Signed URL generation required
+  
+  duration      Int       // seconds
+  thumbnailUrl  String?
+  
+  @@map("video_contents")
+}
+
+model PdfContent {
+  id              String    @id @default(uuid())
+  lessonId        String    @unique
+  lesson          Lesson    @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  
+  // Secure PDF storage
+  cloudinaryPublicId  String
+  fileName            String
+  
+  // Watermarking
+  watermarkText       String    @default("Nextgen Maths - {studentName}")
+  
+  @@map("pdf_contents")
+}
+
+model LessonProgress {
+  id            String          @id @default(uuid())
+  studentId     String
+  student       StudentProfile  @relation(fields: [studentId], references: [id])
+  lessonId      String
+  
+  progressPercent Int           @default(0)
+  completedAt   DateTime?
+  lastAccessedAt DateTime       @default(now())
+  
+  @@unique([studentId, lessonId])
+  @@map("lesson_progress")
+}
+// models/User.ts
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+
+const UserSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  passwordHash: { type: String, required: true },
+  role: { type: String, enum: ['ADMIN', 'STUDENT'], default: 'STUDENT' },
+  name: { type: String, required: true },
+  phone: String,
+}, { timestamps: true });
+
+// Student Profile Embedded
+const StudentProfileSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  
+  // QR Security
+  qrCodeHash: { type: String, required: true, unique: true },
+  qrCodeEncrypted: { type: String, required: true },
+  qrCodeRotationDate: { type: Date, default: Date.now }, // Rotate monthly for security
+  
+  gradeLevel: { type: Number, required: true, min: 6, max: 11 },
+  preferredLanguage: { type: String, enum: ['SINHALA', 'ENGLISH'], default: 'ENGLISH' },
+  
+  // Subscription embedded for atomic access
+  subscription: {
+    status: { 
+      type: String, 
+      enum: ['ACTIVE', 'EXPIRED', 'CANCELLED', 'PENDING', 'GRACE_PERIOD'],
+      default: 'INACTIVE'
+    },
+    currentPeriodEnd: Date,
+    lastPaymentId: mongoose.Schema.Types.ObjectId,
+    payhereSubscriptionId: String
+  },
+  
+  // Denormalized for quick middleware checks
+  isAccessValid: { type: Boolean, default: false },
+  accessValidUntil: Date,
+  
+  attendanceHistory: [{
+    date: Date,
+    classId: mongoose.Schema.Types.ObjectId,
+    scannedBy: mongoose.Schema.Types.ObjectId,
+    subscriptionStatusAtScan: String,
+    paymentValid: Boolean
+  }]
+}, { timestamps: true });
+
+export const User = mongoose.models.User || mongoose.model('User', UserSchema);
+export const StudentProfile = mongoose.models.StudentProfile || 
+  mongoose.model('StudentProfile', StudentProfileSchema);
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+import { verifyToken } from './lib/auth/jwt';
+import { prisma } from './lib/db/prisma';
+
+// Routes that require active subscription
+const PROTECTED_ROUTES = [
+  '/dashboard/student',
+  '/lessons',
+  '/videos',
+  '/tutes',
+  '/progress',
+];
+
+// Public routes that don't need subscription check
+const PUBLIC_ROUTES = [
+  '/payment',
+  '/payment/success',
+  '/payment/cancel',
+  '/api/webhooks',
+  '/login',
+  '/register',
+  '/',
+];
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+  
+  // Skip middleware for public routes and static files
+  if (PUBLIC_ROUTES.some(route => pathname.startsWith(route)) || 
+      pathname.startsWith('/_next') || 
+      pathname.startsWith('/static')) {
+    return NextResponse.next();
+  }
+  
+  // Check if route requires protection
+  const requiresSubscription = PROTECTED_ROUTES.some(route => 
+    pathname.startsWith(route)
+  );
+  
+  if (!requiresSubscription) {
+    return NextResponse.next();
+  }
+
+  // Verify authentication
+  const token = request.cookies.get('nextgen-token')?.value;
+  
+  if (!token) {
+    return NextResponse.redirect(new URL('/login', request.url));
+  }
+
+  try {
+    const payload = await verifyToken(token);
+    
+    // Admin bypass - full access always
+    if (payload.role === 'ADMIN') {
+      return NextResponse.next();
+    }
+
+    // Student subscription validation
+    if (payload.role === 'STUDENT') {
+      const subscriptionValid = await validateSubscription(payload.userId);
+      
+      if (!subscriptionValid) {
+        // Store intended URL for post-payment redirect
+        const response = NextResponse.redirect(
+          new URL('/payment?status=expired', request.url)
+        );
+        
+        // Set cookie with return URL (24h expiry)
+        response.cookies.set('post_payment_redirect', pathname, {
+          maxAge: 60 * 60 * 24,
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'strict'
+        });
+        
+        return response;
+      }
+      
+      // Add subscription metadata to headers for downstream use
+      const requestHeaders = new Headers(request.headers);
+      requestHeaders.set('x-subscription-valid', 'true');
+      requestHeaders.set('x-user-id', payload.userId);
+      
+      return NextResponse.next({
+        request: { headers: requestHeaders }
+      });
+    }
+    
+  } catch (error) {
+    // Token invalid/expired
+    return NextResponse.redirect(new URL('/login?error=session_expired', request.url));
+  }
+}
+
+// Subscription validation with caching optimization
+async function validateSubscription(userId: string): Promise<boolean> {
+  // Check Redis cache first (frequent checks, reduce DB load)
+  const cacheKey = `sub:${userId}`;
+  const cached = await redis.get(cacheKey);
+  
+  if (cached !== null) {
+    return cached === 'true';
+  }
+
+  // Database check
+  const subscription = await prisma.subscription.findUnique({
+    where: { studentId: userId },
+    select: {
+      status: true,
+      currentPeriodEnd: true
+    }
+  });
+
+  const isValid = subscription?.status === 'ACTIVE' && 
+                  new Date(subscription.currentPeriodEnd) > new Date();
+
+  // Cache result for 5 minutes (reduce DB load during peak traffic)
+  await redis.setex(cacheKey, 300, isValid.toString());
+  
+  return isValid;
+}
+
+export const config = {
+  matcher: [
+    '/((?!api/webhooks|_next/static|_next/image|favicon.ico).*)',
+  ],
+};
+// lib/auth/server-guard.ts
+import { redirect } from 'next/navigation';
+import { getServerSession } from './session';
+import { prisma } from '../db/prisma';
+
+export async function requireActiveSubscription() {
+  const session = await getServerSession();
+  
+  if (!session) {
+    redirect('/login');
+  }
+  
+  if (session.role === 'ADMIN') {
+    return session; // Admins bypass
+  }
+  
+  // Double-check subscription (defense in depth)
+  const subscription = await prisma.subscription.findUnique({
+    where: { studentId: session.userId },
+    include: { student: { select: { preferredLanguage: true } } }
+  });
+  
+  const now = new Date();
+  const isValid = subscription?.status === 'ACTIVE' && 
+                  subscription.currentPeriodEnd > now;
+  
+  if (!isValid) {
+    // Grace period handling (3 days)
+    if (subscription && 
+        subscription.status === 'GRACE_PERIOD' && 
+        subscription.currentPeriodEnd > new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000)) {
+      // Allow access but show warning
+      return { ...session, gracePeriod: true, language: subscription.student.preferredLanguage };
+    }
+    
+    redirect('/payment?status=expired');
+  }
+  
+  return { ...session, language: subscription.student.preferredLanguage };
+}
+// lib/attendance/crypto.ts
+import crypto from 'crypto';
+
+const ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 16;
+const AUTH_TAG_LENGTH = 16;
+
+export class QRCrypto {
+  private static getKey(): Buffer {
+    // Store in environment variable, 32 bytes
+    return Buffer.from(process.env.QR_ENCRYPTION_KEY!, 'hex');
+  }
+
+  static generateStudentPayload(studentId: string, grade: number): string {
+    const timestamp = Date.now();
+    const rotationPeriod = this.getCurrentRotationPeriod();
+    
+    const payload = {
+      sid: studentId,           // Shortened to reduce QR size
+      g: grade,
+      ts: timestamp,
+      rot: rotationPeriod,      // Monthly rotation for security
+      nonce: crypto.randomBytes(4).toString('hex')
+    };
+    
+    return JSON.stringify(payload);
+  }
+
+  static encrypt(payload: string): { encrypted: string; hash: string } {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv(ALGORITHM, this.getKey(), iv);
+    
+    let encrypted = cipher.update(payload, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    
+    const authTag = cipher.getAuthTag();
+    
+    // Combine IV + authTag + encrypted
+    const combined = iv.toString('hex') + authTag.toString('hex') + encrypted;
+    
+    // Generate hash for quick lookup (without decryption)
+    const hash = crypto.createHash('sha256')
+      .update(payload)
+      .digest('hex');
+    
+    return { encrypted: combined, hash };
+  }
+
+  static decrypt(encryptedData: string): object | null {
+    try {
+      const iv = Buffer.from(encryptedData.slice(0, 32), 'hex');
+      const authTag = Buffer.from(encryptedData.slice(32, 64), 'hex');
+      const encrypted = encryptedData.slice(64);
+      
+      const decipher = crypto.createDecipheriv(ALGORITHM, this.getKey(), iv);
+      decipher.setAuthTag(authTag);
+      
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      
+      return JSON.parse(decrypted);
+    } catch (error) {
+      return null; // Tampering detected
+    }
+  }
+
+  private static getCurrentRotationPeriod(): string {
+    const now = new Date();
+    return `${now.getFullYear()}-${now.getMonth()}`;
+  }
+}
+// app/api/student/qr/route.ts
+import { NextResponse } from 'next/server';
+import QRCode from 'qrcode';
+import { QRCrypto } from '@/lib/attendance/crypto';
+import { requireActiveSubscription } from '@/lib/auth/server-guard';
+
+export async function GET() {
+  try {
+    const session = await requireActiveSubscription();
+    
+    // Generate fresh QR payload
+    const payload = QRCrypto.generateStudentPayload(
+      session.userId,
+      session.gradeLevel || 6
+    );
+    
+    const { encrypted, hash } = QRCrypto.encrypt(payload);
+    
+    // Update hash in database for validation
+    await prisma.studentProfile.update({
+      where: { userId: session.userId },
+      data: { qrCodeHash: hash, qrCodeEncrypted: encrypted }
+    });
+    
+    // Generate QR code image
+    const qrDataUrl = await QRCode.toDataURL(encrypted, {
+      width: 400,
+      margin: 2,
+      color: {
+        dark: '#1e293b', // Slate-800
+        light: '#ffffff'
+      },
+      errorCorrectionLevel: 'H' // High - allows 30% damage
+    });
+    
+    return NextResponse.json({
+      qrCode: qrDataUrl,
+      expiresAt: new Date(Date.now() + 5 * 60 * 1000), // 5 min client-side validity
+      hash: hash.slice(0, 8) // Show partial hash for visual verification
+    });
+    
+  } catch (error) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+}
+// components/attendance/QRScanner.tsx
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import { Html5Qrcode } from 'html5-qrcode';
+import { motion, AnimatePresence } from 'framer-motion';
+
+interface ScanResult {
+  studentId: string;
+  name: string;
+  grade: number;
+  paymentStatus: 'VALID' | 'EXPIRED' | 'GRACE';
+  checkInTime: string;
+  photoUrl?: string;
+}
+
+export default function QRScanner({ classId }: { classId: string }) {
+  const scannerRef = useRef<Html5Qrcode | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [lastScan, setLastScan] = useState<ScanResult | null>(null);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  
+  // Audio feedback
+  const playSound = (type: 'success' | 'error' | 'warning') => {
+    if (!soundEnabled) return;
+    const audio = new Audio(`/sounds/${type}.mp3`);
+    audio.play().catch(() => {});
+  };
+
+  useEffect(() => {
+    scannerRef.current = new Html5Qrcode('qr-reader');
+    
+    return () => {
+      scannerRef.current?.stop().catch(() => {});
+    };
+  }, []);
+
+  const startScanner = async () => {
+    try {
+      await scannerRef.current?.start(
+        { facingMode: 'environment' },
+        {
+          fps: 10,
+          qrbox: { width: 250, height: 250 },
+          aspectRatio: 1
+        },
+        handleScan,
+        () => {} // Ignore scan failures (continuous scanning)
+      );
+      setScanning(true);
+    } catch (error) {
+      console.error('Scanner failed:', error);
+    }
+  };
+
+  const handleScan = async (decodedText: string) => {
+    // Prevent duplicate scans (2-second cooldown)
+    if (lastScan && Date.now() - new Date(lastScan.checkInTime).getTime() < 2000) {
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/attendance/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          qrData: decodedText,
+          classId,
+          scannerLocation: 'Main Hall' // Could be dynamic
+        })
+      });
+
+      const result = await response.json();
+      
+      if (result.success) {
+        setLastScan(result.data);
+        playSound(result.data.paymentStatus === 'VALID' ? 'success' : 'warning');
+      } else {
+        playSound('error');
+        // Show error toast
+      }
+    } catch (error) {
+      playSound('error');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4">
+      <div className="max-w-4xl mx-auto space-y-6">
+        
+        {/* Header */}
+        <div className="flex items-center justify-between bg-white p-4 rounded-2xl shadow-sm">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-800">
+              Attendance Scanner
+            </h1>
+            <p className="text-slate-500">Point camera at student QR code</p>
+          </div>
+          <button
+            onClick={() => setSoundEnabled(!soundEnabled)}
+            className="p-2 rounded-full hover:bg-slate-100"
+          >
+            {soundEnabled ? '🔊' : '🔇'}
+          </button>
+        </div>
+
+        {/* Scanner Viewport */}
+        <div className="relative bg-black rounded-3xl overflow-hidden shadow-2xl">
+          <div id="qr-reader" className="w-full aspect-square" />
+          
+          {!scanning && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+              <button
+                onClick={startScanner}
+                className="px-8 py-4 bg-emerald-500 text-white rounded-full font-semibold 
+                         hover:bg-emerald-600 transition-colors"
+              >
+                Start Scanner
+              </button>
+            </div>
+          )}
+          
+          {/* Scanning Overlay */}
+          <div className="absolute inset-0 pointer-events-none">
+            <div className="absolute inset-0 border-2 border-white/20 rounded-3xl" />
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 
+                          w-64 h-64 border-2 border-emerald-400/50 rounded-lg">
+              <div className="absolute top-0 left-0 w-4 h-4 border-t-4 border-l-4 border-emerald-400" />
+              <div className="absolute top-0 right-0 w-4 h-4 border-t-4 border-r-4 border-emerald-400" />
+              <div className="absolute bottom-0 left-0 w-4 h-4 border-b-4 border-l-4 border-emerald-400" />
+              <div className="absolute bottom-0 right-0 w-4 h-4 border-b-4 border-r-4 border-emerald-400" />
+            </div>
+          </div>
+        </div>
+
+        {/* Last Scan Result */}
+        <AnimatePresence mode="wait">
+          {lastScan && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className={`p-6 rounded-2xl shadow-lg ${
+                lastScan.paymentStatus === 'VALID' ? 'bg-emerald-50 border-2 border-emerald-200' :
+                lastScan.paymentStatus === 'GRACE' ? 'bg-amber-50 border-2 border-amber-200' :
+                'bg-rose-50 border-2 border-rose-200'
+              }`}
+            >
+              <div className="flex items-center gap-4">
+                <div className="w-16 h-16 rounded-full bg-slate-200 flex items-center justify-center text-2xl">
+                  {lastScan.photoUrl ? (
+                    <img src={lastScan.photoUrl} className="w-full h-full rounded-full object-cover" />
+                  ) : (
+                    '👤'
+                  )}
+                </div>
+                <div className="flex-1">
+                  <h3 className="text-xl font-bold text-slate-800">{lastScan.name}</h3>
+                  <p className="text-slate-600">Grade {lastScan.grade}</p>
+                  <div className="flex items-center gap-2 mt-2">
+                    <span className={`px-3 py-1 rounded-full text-sm font-medium ${
+                      lastScan.paymentStatus === 'VALID' ? 'bg-emerald-100 text-emerald-700' :
+                      lastScan.paymentStatus === 'GRACE' ? 'bg-amber-100 text-amber-700' :
+                      'bg-rose-100 text-rose-700'
+                    }`}>
+                      {lastScan.paymentStatus === 'VALID' ? '✓ Payment Active' :
+                       lastScan.paymentStatus === 'GRACE' ? '⚠ Grace Period' :
+                       '✗ Payment Expired'}
+                    </span>
+                    <span className="text-sm text-slate-500">
+                      {new Date(lastScan.checkInTime).toLocaleTimeString()}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Today's Stats */}
+        <div className="grid grid-cols-3 gap-4">
+          <StatCard label="Present" value={12} color="emerald" />
+          <StatCard label="Payment Issues" value={2} color="rose" />
+          <StatCard label="Total Class" value={25} color="slate" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <div className="bg-white p-4 rounded-2xl shadow-sm text-center">
+      <div className={`text-3xl font-bold text-${color}-600`}>{value}</div>
+      <div className="text-sm text-slate-500">{label}</div>
+    </div>
+  );
+}
+// app/api/attendance/scan/route.ts
+import { NextResponse } from 'next/server';
+import { QRCrypto } from '@/lib/attendance/crypto';
+import { prisma } from '@/lib/db/prisma';
+import { requireAdmin } from '@/lib/auth/server-guard';
+import { redis } from '@/lib/redis';
+
+// Rate limiting: max 100 scans per minute per admin
+const RATE_LIMIT_WINDOW = 60;
+const MAX_SCANS = 100;
+
+export async function POST(request: Request) {
+  try {
+    const admin = await requireAdmin();
+    const body = await request.json();
+    const { qrData, classId, scannerLocation } = body;
+
+    // Rate limiting check
+    const rateKey = `scan_rate:${admin.userId}`;
+    const currentScans = await redis.incr(rateKey);
+    if (currentScans === 1) {
+      await redis.expire(rateKey, RATE_LIMIT_WINDOW);
+    }
+    if (currentScans > MAX_SCANS) {
+      return NextResponse.json(
+        { error: 'Rate limit exceeded. Please slow down.' },
+        { status: 429 }
+      );
+    }
+
+    // Decrypt QR payload
+    const payload = QRCrypto.decrypt(qrData);
+    if (!payload) {
+      return NextResponse.json(
+        { error: 'Invalid QR code. Possible tampering detected.' },
+        { status: 400 }
+      );
+    }
+
+    const { sid: studentId, g: grade, rot: rotationPeriod } = payload as any;
+    
+    // Verify rotation period (prevent old QR codes)
+    const currentRotation = QRCrypto.getCurrentRotationPeriod();
+    if (rotationPeriod !== currentRotation) {
+      return NextResponse.json(
+        { error: 'QR code expired. Please refresh student app.' },
+        { status: 400 }
+      );
+    }
+
+    // Fetch student with current subscription status
+    const student = await prisma.studentProfile.findUnique({
+      where: { userId: studentId },
+      include: {
+        user: { select: { name: true } },
+        subscription: true
+      }
+    });
+
+    if (!student) {
+      return NextResponse.json({ error: 'Student not found' }, { status: 404 });
+    }
+
+    // Check for duplicate scan today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const existingScan = await prisma.attendanceRecord.findFirst({
+      where: {
+        studentId,
+        scannedAt: { gte: today }
+      }
+    });
+
+    if (existingScan) {
+      return NextResponse.json({
+        success: true,
+        data: {
+          studentId,
+          name: student.user.name,
+          grade: student.gradeLevel,
+          paymentStatus: getPaymentStatus(student.subscription),
+          checkInTime: existingScan.scannedAt.toISOString(),
+          alreadyScanned: true
+        }
+      });
+    }
+
+    // Determine payment status
+    const now = new Date();
+    let paymentStatus: 'VALID' | 'EXPIRED' | 'GRACE' = 'EXPIRED';
+    
+    if (student.subscription?.status === 'ACTIVE' && 
+        student.subscription.currentPeriodEnd > now) {
+      paymentStatus = 'VALID';
+    } else if (student.subscription?.status === 'GRACE_PERIOD') {
+      const graceEnd = new Date(student.subscription.currentPeriodEnd);
+      graceEnd.setDate(graceEnd.getDate() + 3);
+      if (graceEnd > now) paymentStatus = 'GRACE';
+    }
+
+    // Record attendance
+    const attendance = await prisma.attendanceRecord.create({
+      data: {
+        studentId,
+        scannedBy: admin.userId,
+        scannerLocation,
+        classId: classId || null,
+        subscriptionStatusAtScan: student.subscription?.status || 'INACTIVE',
+        paymentValidAtScan: paymentStatus === 'VALID',
+        qrCodeHashUsed: student.qrCodeHash,
+        isValid: true
+      }
+    });
+
+    // Real-time notification (optional WebSocket)
+    await redis.publish(`attendance:${classId}`, JSON.stringify({
+      studentId,
+      name: student.user.name,
+      timestamp: attendance.scannedAt
+    }));
+
+    return NextResponse.json({
+      success: true,
+      data: {
+        studentId,
+        name: student.user.name,
+        grade: student.gradeLevel,
+        paymentStatus,
+        checkInTime: attendance.scannedAt.toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Scan processing error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
+
+function getPaymentStatus(sub: any): 'VALID' | 'EXPIRED' | 'GRACE' {
+  if (!sub) return 'EXPIRED';
+  const now = new Date();
+  if (sub.status === 'ACTIVE' && sub.currentPeriodEnd > now) return 'VALID';
+  if (sub.status === 'GRACE_PERIOD') return 'GRACE';
+  return 'EXPIRED';
+}
+// lib/attendance/anti-spoofing.ts
+
+export class AntiSpoofing {
+  // Track QR usage patterns
+  static async validateScanPattern(studentId: string, ip: string): Promise<boolean> {
+    const key = `scan_pattern:${studentId}`;
+    const recentScans = await redis.lrange(key, 0, -1);
+    
+    // Check for impossible travel (scanned in different locations within 5 minutes)
+    const now = Date.now();
+    const fiveMinutesAgo = now - 5 * 60 * 1000;
+    
+    const suspiciousScans = recentScans.filter((scan: string) => {
+      const data = JSON.parse(scan);
+      return data.timestamp > fiveMinutesAgo && data.ip !== ip;
+    });
+    
+    if (suspiciousScans.length > 0) {
+      // Flag for review but don't block (could be legitimate network changes)
+      await this.flagSuspiciousActivity(studentId, 'impossible_travel');
+    }
+    
+    // Store this scan
+    await redis.lpush(key, JSON.stringify({ timestamp: now, ip }));
+    await redis.ltrim(key, 0, 99); // Keep last 100
+    await redis.expire(key, 24 * 60 * 60); // 24h retention
+    
+    return true;
+  }
+
+  // Detect screenshot/screen sharing (basic heuristic)
+  static async detectScreenSharing(imageData?: Buffer): Promise<boolean> {
+    // In production, use ML model to detect:
+    // - Moiré patterns (screenshot of screen)
+    // - Aspect ratio anomalies
+    // - Reflection detection
+    return false; // Placeholder
+  }
+
+  private static async flagSuspiciousActivity(studentId: string, reason: string) {
+    await prisma.securityLog.create({
+      data: {
+        studentId,
+        reason,
+        severity: 'MEDIUM',
+        timestamp: new Date()
+      }
+    });
+  }
+}
+// Admin dashboard for attendance reports
+interface AttendanceReport {
+  date: string;
+  present: number;
+  absent: number;
+  paymentIssues: number;
+  revenueAtRisk: number; // Students with expired payments
+}
+
+// Automated daily report to Monk (Teacher)
+export async function sendDailyReport() {
+  const today = new Date();
+  const report = await generateReport(today);
+  
+  // Email/SMS to teacher
+  // WhatsApp Business API integration for Sri Lanka context
+}
+
+// app/api/webhooks/payhere/route.ts
+import { NextResponse } from 'next/server';
+import crypto from 'crypto';
+import { prisma } from '@/lib/db/prisma';
+
+export async function POST(request: Request) {
+  const payload = await request.formData();
+  
+  // Verify PayHere signature
+  const merchantId = process.env.PAYHERE_MERCHANT_ID!;
+  const merchantSecret = process.env.PAYHERE_MERCHANT_SECRET!;
+  
+  const localMd5Sig = crypto
+    .createHash('md5')
+    .update(
+      merchantId + 
+      payload.get('order_id') + 
+      payload.get('payhere_amount') + 
+      payload.get('payhere_currency') + 
+      crypto.createHash('md5').update(merchantSecret).digest('hex').toUpperCase()
+    )
+    .digest('hex')
+    .toUpperCase();
+
+  if (localMd5Sig !== payload.get('status_code')) {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  const studentId = payload.get('custom_1') as string; // Passed during checkout
+  const status = payload.get('status_code'); // 2 = success
+  
+  if (status === '2') {
+    await prisma.$transaction(async (tx) => {
+      // Create payment record
+      const payment = await tx.payment.create({
+        data: {
+          subscriptionId: studentId, // Link to subscription
+          payherePaymentId: payload.get('payment_id') as string,
+          payhereOrderId: payload.get('order_id') as string,
+          amount: parseFloat(payload.get('payhere_amount') as string),
+          currency: payload.get('payhere_currency') as string,
+          status: 'COMPLETED',
+          paidAt: new Date(),
+          webhookPayload: Object.fromEntries(payload),
+          webhookReceivedAt: new Date()
+        }
+      });
+
+      // Update subscription
+      const now = new Date();
+      const periodEnd = new Date(now);
+      periodEnd.setMonth(periodEnd.getMonth() + 1);
+
+      await tx.subscription.upsert({
+        where: { studentId },
+        create: {
+          studentId,
+          status: 'ACTIVE',
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd
+        },
+        update: {
+          status: 'ACTIVE',
+          currentPeriodStart: now,
+          currentPeriodEnd: periodEnd
+        }
+      });
+
+      // Clear subscription cache
+      await redis.del(`sub:${studentId}`);
+    });
+  }
+
+  return NextResponse.json({ success: true });
+}
+// lib/i18n/config.ts
+import { createContext, useContext } from 'react';
+
+type Locale = 'en' | 'si'; // English | Sinhala
+
+const translations = {
+  en: {
+    dashboard: 'Dashboard',
+    attendance: 'Attendance',
+    paymentRequired: 'Payment Required',
+    scanQR: 'Scan QR Code',
+    // ...
+  },
+  si: {
+    dashboard: 'උපකරණ පුවරුව',
+    attendance: 'පැමිණීම',
+    paymentRequired: 'ගෙවීම අවශ්‍යයි',
+    scanQR: 'QR කේතය ස්කෑන් කරන්න',
+    // ...
+  }
+};
+
+// Context provider for language switching
+// Store preference in StudentProfile.preferredLanguage
+// Use next-intl for routing: /en/dashboard or /si/dashboard
